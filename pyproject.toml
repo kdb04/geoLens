@@ -1,0 +1,10 @@
+[project]
+name = "geolens"
+version = "0.1.0"
+description = "GeoLens: geospatial file measurement API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.142.4",
+    "uvicorn[standard]>=0.54.0",
+]
