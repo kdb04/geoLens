@@ -31,6 +31,8 @@ class FileUploadResponse(BaseModel):
     id: str
     filename: str
     status: str
+    feature_count: int
+    crs: str | None
 
 class FeatureResponse(BaseModel):
     id: int
@@ -83,22 +85,38 @@ def _store_upload(
     upload: UploadFile, 
     file_id: str, 
     extension: str
-) -> None:
+) -> Path:
     """
-    Persist the upload under UPLOAD_DIR/<file_id>/ alongside its metadata.
+    Persist the uploaded data under UPLOAD_DIR/<file_id>/ and return its path.
 
     Raises:
-        HTTPException: 500 if the file or its metadata cannot be written.
+        HTTPException: 500 if the file cannot be written.
     """
     file_dir = UPLOAD_DIR / file_id
+    data_path = file_dir / f"file{extension}"
     try:
         file_dir.mkdir(parents=True)
-        with open(file_dir / f"file{extension}", "wb") as destination:
+        with open(data_path, "wb") as destination:
             shutil.copyfileobj(upload.file, destination)
-        metadata = {"id": file_id, "filename": upload.filename, "status": "UPLOADED"}
-        (file_dir / "metadata.json").write_text(json.dumps(metadata))
     except OSError as exc:
         shutil.rmtree(file_dir, ignore_errors=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to store uploaded file"
+        ) from exc
+    return data_path
+
+
+def _write_metadata(file_id: str, filename: str | None) -> None:
+    """
+    Record a successfully processed upload in UPLOAD_DIR/<file_id>/metadata.json.
+
+    Raises:
+        HTTPException: 500 if the metadata cannot be written.
+    """
+    metadata = {"id": file_id, "filename": filename, "status": "COMPLETED"}
+    try:
+        (UPLOAD_DIR / file_id / "metadata.json").write_text(json.dumps(metadata))
+    except OSError as exc:
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to store uploaded file"
         ) from exc
@@ -107,12 +125,36 @@ def _store_upload(
 @router.post("/", response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
 def upload_file(file: UploadFile = File(...)) -> FileUploadResponse:
     """
-    Accept a .kml or .zip (Shapefile) upload and store it for later processing.
+    Accept a .kml or .zip (Shapefile) upload, store it, and parse it to extract its features.
+
+    The upload is only accepted if it parses. metadata.json is written after parsing
+    succeeds, with status COMPLETED. Measurements are not calculated here.
+
+    Raises:
+        HTTPException: 400/415 for a missing filename or unsupported extension, 422 if the
+            file cannot be parsed, 500 if it cannot be stored.
     """
     extension = _validated_extension(file.filename)
     file_id = uuid.uuid4().hex
-    _store_upload(file, file_id, extension)
-    return FileUploadResponse(id=file_id, filename=file.filename, status="UPLOADED")
+    data_path = _store_upload(file, file_id, extension)
+    try:
+        parsed = parse_file(data_path)
+        _write_metadata(file_id, file.filename)
+    except GeoParseError as exc:
+        shutil.rmtree(UPLOAD_DIR / file_id, ignore_errors=True)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except Exception:
+        # Not a client error: don't leave a half-accepted upload behind, but let it surface as a 500
+        shutil.rmtree(UPLOAD_DIR / file_id, ignore_errors=True)
+        raise
+    return FileUploadResponse(
+        id=file_id,
+        filename=file.filename,
+        status="COMPLETED",
+        feature_count=len(parsed.features),
+        crs=_crs_label(parsed.crs),
+    )
+
 
 def _load_stored_file(file_id: str) -> tuple[dict[str, Any], Path]:
     """

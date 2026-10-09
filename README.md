@@ -30,7 +30,7 @@ All three endpoints live under `/api/files/`. IDs are 32-character lowercase hex
 
 ### `POST /api/files/` — upload
 
-Multipart form upload with a single field named `file`. Accepted extensions: `.kml`, `.zip` (a ZIP containing a Shapefile). The file is stored as-is and given an ID; it is parsed when you request it with the GET endpoints.
+Multipart form upload with a single field named `file`. Accepted extensions: `.kml`, `.zip` (a ZIP containing a Shapefile). The file is stored under a new ID and **parsed during the upload** to extract its features. If it cannot be parsed (invalid KML, a ZIP that is not a valid Shapefile archive, ...) the upload is rejected with `422` and nothing is kept. Measurements are not calculated at upload; they are calculated by the measurements endpoint.
 
 ```bash
 curl -F "file=@survey.kml" http://localhost:8000/api/files/
@@ -39,13 +39,15 @@ curl -F "file=@survey.kml" http://localhost:8000/api/files/
 `201 Created`:
 
 ```json
-{"id": "3f2a9c0d4b7e4d1a8c5e6f7a8b9c0d1e", "filename": "survey.kml", "status": "UPLOADED"}
+{"id": "3f2a9c0d4b7e4d1a8c5e6f7a8b9c0d1e", "filename": "survey.kml", "status": "COMPLETED", "feature_count": 4, "crs": "EPSG:4326"}
 ```
 
-- `201` → file stored
+`crs` is `null` when the file declares none (for example a Shapefile without a `.prj`); such a file is still accepted, but its measurements will be refused.
+
+- `201` → file stored and parsed
 - `400` → uploaded part has no filename
 - `415` → extension is not `.kml` or `.zip`
-- `422` → no `file` field in the request
+- `422` → the file cannot be parsed (invalid KML, not a valid ZIP, no `.shp`, missing `.shx`/`.dbf`, more than one Shapefile, malformed Shapefile; the same messages as the GET endpoints), or no `file` field in the request
 - `500` → the file could not be written to disk
 
 ### `GET /api/files/{id}/` — file information and features
@@ -93,7 +95,7 @@ Notes:
 - `geometry` is a GeoJSON-style geometry object produced from the parsed Shapely geometry. **Its coordinates stay in the file's own CRS** (given in `crs`) and are not reprojected, so it is not necessarily longitude/latitude. A feature without geometry has `"geometry": null` and `"geometry_type": null`. Z values are kept when present.
 - `crs` is `EPSG:<code>` when the CRS has an EPSG code, otherwise the CRS name, and `null` if the file declares no CRS (for example a Shapefile without a `.prj`).
 - `properties` are the attributes of the feature. For KML they include the standard fields GDAL exposes (`Name`, `description`, `timestamp`, ...) plus any `ExtendedData`.
-- `status` is `COMPLETED` when the file was parsed successfully by this request. The file is re-parsed on every request; nothing is cached.
+- `status` is `COMPLETED`: the file was parsed successfully (it already was at upload). The stored file is parsed again on every request; nothing is cached.
 
 ### `GET /api/files/{id}/measurements/` — measurements
 
@@ -135,7 +137,7 @@ Errors use FastAPI's standard body, `{"detail": "<message>"}`.
 - `422` → measurements only: no measurement CRS can be chosen (data beyond 84°N / 80°S or impossible coordinates)
 - `500` → the upload directory exists but its stored file or `metadata.json` is missing or corrupt
 
-Because the upload endpoint does not parse, a malformed file is accepted with `201` and reported with `422` when it is read (see [Design decisions](#design-decisions)). A file with no CRS can still be read with `GET /api/files/{id}/` (it returns `"crs": null`); only the measurements are refused.
+Malformed files are normally rejected at upload, so the `422` parsing errors above only occur if a stored file is damaged afterwards. A file with no CRS is accepted at upload and can still be read with `GET /api/files/{id}/` (it returns `"crs": null`); only the measurements are refused.
 
 ## Architecture
 
@@ -167,8 +169,10 @@ POST /api/files/
   -> check the extension (.kml / .zip)
   -> generate an id (uuid4 hex), independent of the client filename
   -> stream the upload to uploads/<id>/file.<ext>
-  -> write uploads/<id>/metadata.json  {"id", "filename" (original name), "status": "UPLOADED"}
-  -> 201 {id, filename, status}
+  -> parse_file() the stored file (same parser as the GET endpoints)
+       on a parsing error: delete uploads/<id>/ and answer 422
+  -> write uploads/<id>/metadata.json  {"id", "filename" (original name), "status": "COMPLETED"}
+  -> 201 {id, filename, status, feature_count, crs}
 
 GET /api/files/{id}/
   -> validate the id (32 hex chars) and locate uploads/<id>/
@@ -220,7 +224,7 @@ Details:
 
 - **FastAPI rather than Django.** The service is a small, stateless API: FastAPI gives request validation, Pydantic response models and interactive docs (`/docs`) with very little code. Django + DRF would add an ORM and project scaffolding that this assignment does not need.
 - **Filesystem storage instead of a database.** Each upload lives in `uploads/<id>/` with a small `metadata.json` holding the original filename. The ID comes from `uuid4`, never from the client filename, and the stored name is built only from the ID and an allowlisted extension, so a hostile filename cannot influence the path. Alternatives considered: SQLite/PostgreSQL (more moving parts, and nothing here needs queries), object storage (unnecessary locally). The cost is that there is no listing, no atomic status tracking and no cleanup of old uploads.
-- **Upload stores, GET processes (lazy processing).** `POST` only validates the extension and stores the file; parsing, CRS handling and measuring run when the data is requested. This keeps the upload fast and means no processing state has to be persisted: the status `COMPLETED` is derived ("parsed successfully on this request") and the stored `metadata.json` stays `UPLOADED`. The trade-offs: each GET re-parses the file, and a malformed file is accepted at upload and only rejected (`422`) when read. Alternative considered: parse at upload time, reject bad files immediately and persist the results; this would need persistence for the results or a status field, which was out of scope here.
+- **Parse at upload, re-parse on read.** `POST` stores the file, parses it with the same `parse_file` the GET endpoints use, and only then accepts it: malformed files are rejected immediately with `422` and their directory is removed, so `uploads/` only ever contains files that parse. `metadata.json` is written last, with status `COMPLETED`. Measurements are deliberately not computed at upload: they are produced by the measurements endpoint. The parsed features are **not** persisted, so each GET parses the stored file again; this keeps the design free of a database or cache at the price of repeated work for large files. Alternatives considered: only storing at upload and parsing lazily (simpler and faster uploads, but a bad file is accepted and only fails later), or persisting parsed results (would need a database or serialized results, out of scope here).
 - **GeoPandas (pyogrio / GDAL) for reading, one dependency.** It reads both KML and Shapefile, yields Shapely geometries and pyproj CRS objects, and the same stack does the transformation and the measurements. Alternatives: `fiona` (older engine), a dedicated KML library or hand-written XML parsing (more code, more edge cases). Caveat: GDAL's KML driver exposes one layer per Folder, so all layers are read explicitly, and it adds its own standard columns to the properties.
 - **Services separated from the web layer.** Parsing, CRS selection and measurement are plain functions over dataclasses, each in its own module with a single exception type, so the routes contain no geospatial logic and each stage can be exercised on its own.
 - **One UTM zone per file.** Alternatives: a zone per feature (slightly more accurate for far-apart features, but the file would have no single measurement CRS and values would come from different projections); geodesic (ellipsoidal) calculation with `pyproj.Geod` (very accurate, but the assignment asks for a projected CRS); an equal-area projection centred on the data (exact areas but no EPSG code and distorted lengths); Web Mercator (rejected, it inflates areas by roughly 1/cos²(latitude), about 4× at 60° latitude). UTM is conformal, metre-based, has EPSG codes that can be reported, and keeps the error within a zone at roughly 0.1 % or less. Checked on the sample KML (a 0.001° × 0.001° polygon near 13°N): 12016.97 m² and a 586.21 m line against 12003.11 m² and 585.87 m from an independent ellipsoidal calculation.
@@ -252,7 +256,7 @@ uv run python -m app.services.measurement  <file.kml|file.zip>   # per-feature a
 - **UTM zone selection and its limits.** Zones are 6° wide, the choice follows the centre of the data, data beyond 84°N / 80°S has no UTM zone, and distortion grows for files spanning many zones.
 - **PROJ edge cases.** Out-of-range coordinates do not always raise: a transformation can silently return infinite coordinates, so the result has to be checked.
 - **Making results JSON-safe.** DataFrame missing values (`NaN`/`NaT`) must be turned into `None` before they reach the response, and Shapely geometries need an explicit serialization (`mapping()`) that matches the coordinates' actual CRS.
-- **Designing for a no-database constraint.** Deriving state (`COMPLETED`) from what happens on each request, and keeping the original filename in a small metadata file, removes the need for any persistence layer, at the price of re-processing per request.
+- **Designing for a no-database constraint.** Keeping the original filename and a `COMPLETED` status in a small metadata file, written only after the upload parses, removes the need for any persistence layer; the parsed data itself is recomputed from the stored file on each request.
 - **FastAPI details.** Blocking file and geospatial work belongs in plain `def` routes (run in a threadpool); path parameters that end up in filesystem paths must be validated before use.
 
 ## Future scope and limitations
@@ -260,7 +264,7 @@ uv run python -m app.services.measurement  <file.kml|file.zip>   # per-feature a
 Limitations of the current implementation:
 
 - Files are parsed on every request; there is no persistence of results, caching, or processing status. Large files will be slow, and uploads are neither size-limited nor expired.
-- A malformed file is only detected when it is read, not at upload time.
+- Parsed features are not persisted or cached, so every GET parses the stored file again; the upload also parses the file once, which makes large uploads slower.
 - No pagination: `GET /api/files/{id}/` returns every feature with its full geometry.
 - Accuracy degrades for files spanning many UTM zones (one zone per file); data crossing the antimeridian is not handled meaningfully; data beyond 84°N / 80°S is rejected.
 - `GeometryCollection` contents are not measured; invalid geometries are measured as-is with a warning.
@@ -270,7 +274,7 @@ Limitations of the current implementation:
 
 Possible next steps:
 
-- Process at upload time (optionally in a background worker) and store results and a real `status` in a database such as PostgreSQL/PostGIS; listing and deleting uploads; retention and size limits.
+- Process uploads in a background worker with a real status lifecycle (`PROCESSING`/`FAILED`), and store the results in a database such as PostgreSQL/PostGIS; listing and deleting uploads; retention and size limits.
 - Automated tests and CI; a Dockerfile.
 - Protection against decompression bombs and upload size limits.
 - Pagination, filtering, or a bounding-box summary for large files; optional reprojection of returned geometry to WGS 84.
